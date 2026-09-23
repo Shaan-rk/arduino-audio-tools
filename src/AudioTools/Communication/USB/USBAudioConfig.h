@@ -174,7 +174,7 @@ struct USBAudioConfig : public AudioInfo {
   /// discrete rates listed in supported_sample_rates below.  The host can
   /// change the rate via SET_CUR, and the descriptor wMaxPacketSize covers
   /// the highest rate in that list.
-  bool enable_multi_sample_rate = false;
+  bool enable_multi_sample_rate = true;
 
   /// Discrete sample rates advertised in the Clock Source GET_RANGE response
   /// when enable_multi_sample_rate is true (ignored otherwise). Isochronous
@@ -189,7 +189,7 @@ struct USBAudioConfig : public AudioInfo {
   /// Override before begin() to advertise a different set, e.g. just
   /// {44100, 48000}.
   std::vector<uint32_t> supported_sample_rates = {8000,  11025, 16000, 22050,
-                                                   24000, 32000, 44100, 48000};
+                                                   24000, 32000, 44100, 48000, 96000, 192000};
 
   /// Enable the AC interrupt IN endpoint for device-initiated volume, mute,
   /// and sample-rate change notifications.  Without it the host must poll
