@@ -174,7 +174,7 @@ struct USBAudioConfig : public AudioInfo {
   /// discrete rates listed in supported_sample_rates below.  The host can
   /// change the rate via SET_CUR, and the descriptor wMaxPacketSize covers
   /// the highest rate in that list.
-  bool enable_multi_sample_rate = true;
+  bool enable_multi_sample_rate = false;
 
   /// Discrete sample rates advertised in the Clock Source GET_RANGE response
   /// when enable_multi_sample_rate is true (ignored otherwise). Isochronous
