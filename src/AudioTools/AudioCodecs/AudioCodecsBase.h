@@ -140,6 +140,10 @@ class AudioDecoderExt : public AudioDecoder {
   /// decoder does not (always) map to a single WAV format tag - in this
   /// case the format must be provided explicitly.
   virtual AudioFormat wavFormat() { return AudioFormat::UNKNOWN; }
+  /// Provides the codec specific data which follows the standard fields of
+  /// the WAV 'fmt ' chunk (e.g. the ATRAC3 extradata). It is called by the
+  /// WAVDecoder before begin(); the default implementation ignores it.
+  virtual void setExtraData(const uint8_t *data, size_t len) {}
 };
 
 /// @brief  Extended AudioEncoder interface to support block size configuration
@@ -159,8 +163,10 @@ class AudioEncoderExt : public AudioEncoder {
 class CodecNOP : public AudioDecoder, public AudioEncoder {
  public:
   static CodecNOP *instance() {
-    static CodecNOP self;
-    return &self;
+    // never destroyed: it is still used by objects which are destroyed after
+    // the end of main() (e.g. global streams on the desktop)
+    static CodecNOP *self = new CodecNOP();
+    return self;
   }
 
   virtual bool begin() { return true; }

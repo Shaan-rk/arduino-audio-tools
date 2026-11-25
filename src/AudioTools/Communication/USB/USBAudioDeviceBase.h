@@ -42,55 +42,14 @@
 #include "AudioLogger.h"
 #include "AudioTools/CoreAudio/BaseStream.h"
 #include "AudioTools/Communication/USB/USBAudioBackend.h"
+#include "AudioTools/Communication/USB/USBAudioConstants.h"
+#include "AudioTools/Communication/USB/USBAudioStreamBase.h"
 #include "USBAudio2DescriptorBuilder.h"
 
 #define USB_DESCR_MAX_LEN 512
 
 namespace audio_tools {
 
-// ── UAC2 / USB 2.0 spec constants ───────────────────────────────────────────
-// These are fixed byte values defined by the USB 2.0 and UAC2 specs, not
-// TinyUSB API surface (TinyUSB's own headers just give them names). Owned
-// here directly so USBAudioDeviceBase has zero dependency on any particular
-// USB stack's headers.
-
-// Descriptor types (USB 2.0 spec Table 9-5).
-static constexpr uint8_t kUsbDescTypeInterface = 0x04;
-static constexpr uint8_t kUsbDescTypeEndpoint = 0x05;
-static constexpr uint8_t kUsbDescTypeCsInterface = 0x24;
-
-// Audio class/subclass/protocol codes (UAC2 spec Appendix A).
-static constexpr uint8_t kUsbClassAudio = 0x01;
-static constexpr uint8_t kAudioSubclassControl = 0x01;
-static constexpr uint8_t kAudioIntProtocolCodeV2 = 0x20;
-
-// AC interface descriptor subtypes (UAC2 Table A-9).
-static constexpr uint8_t kAudioCsAcInputTerminal = 0x02;
-static constexpr uint8_t kAudioCsAcOutputTerminal = 0x03;
-// AS interface descriptor subtypes (UAC2 Table A-11).
-static constexpr uint8_t kAudioCsAsGeneral = 0x01;
-static constexpr uint8_t kAudioCsAsFormatType = 0x02;
-// Control request codes (UAC2 Table A-15).
-static constexpr uint8_t kAudioCsReqCur = 0x01;
-static constexpr uint8_t kAudioCsReqRange = 0x02;
-// Clock Source control selectors (UAC2 Table A-18).
-static constexpr uint8_t kAudioCsCtrlSamFreq = 0x01;
-static constexpr uint8_t kAudioCsCtrlClkValid = 0x02;
-// Feature Unit control selectors (UAC2 Table A-23).
-static constexpr uint8_t AUDIO_FU_CTRL_MUTE = 0x01;
-static constexpr uint8_t AUDIO_FU_CTRL_VOLUME = 0x02;
-// Terminal type: USB Streaming (UAC2 Table 2-1).
-static constexpr uint16_t kAudioTermTypeUsbStreaming = 0x0101;
-// Interface Association Descriptor length — fixed 8 bytes.
-static constexpr uint16_t kAudioDescIadLen = 8;
-
-// USB control-transfer state-machine stages (universal to any USB stack's
-// control-transfer handling, not TinyUSB-specific).
-static constexpr uint8_t kControlStageSetup = 1;
-static constexpr uint8_t kControlStageData = 2;
-
-static inline uint8_t u16Low(uint16_t v) { return (uint8_t)(v & 0xFF); }
-static inline uint8_t u16High(uint16_t v) { return (uint8_t)(v >> 8); }
 
 /**
  * @brief USB Audio Device class for audio streaming over USB.
@@ -106,7 +65,7 @@ static inline uint8_t u16High(uint16_t v) { return (uint8_t)(v >> 8); }
  * @ingroup io
  * @copyright GPLv3
  */
-class USBAudioDeviceBase : public AudioStream, public VolumeSupport {
+class USBAudioDeviceBase : public USBAudioStreamBase {
 public:
   /**
    * @brief Supported USB audio format types.
@@ -162,6 +121,11 @@ public:
     uint8_t
         ep_out_as_intf_num;  // Standard AS Interface Descriptor number for OUT
     uint8_t ep_fb;           // Feedback EP.
+    // Feedback EP with a transfer queued, or 0.  Unlike ep_fb, it isn't
+    // cleared when the stream closes, so a completion that arrives after
+    // that is still recognised; it's cleared when the endpoint is activated
+    // again (openEpFeedback()).  See audiod_fb_kick().
+    uint8_t ep_fb_xfer;
     uint8_t ep_int;          // Audio control interrupt EP.
     bool mounted;            // Device opened
     uint16_t desc_length;    // Length of audio function descriptor
@@ -169,6 +133,10 @@ public:
       uint32_t value;
       uint32_t min_value;
       uint32_t max_value;
+      // Nominal value (fb_param.sample_freq) and the setFeedbackPpm() offset
+      // from it, in the same 16.16 format.  See setupFeedback().
+      uint32_t nom_value;
+      volatile int32_t ppm_offset;
       uint8_t frame_shift;
       uint8_t compute_method;
       bool format_correction;
@@ -354,9 +322,7 @@ public:
       desc_len_.assign(n, desc_len);
 
       // master (index 0) + one per channel
-      const size_t vol_sz = (size_t)config_.channels + 1;
-      volume_.assign(vol_sz, 1.0f);
-      mute_.assign(vol_sz, false);
+      setupVolumeState();
 
 
       audiod_init();
@@ -387,15 +353,11 @@ public:
    */
   static USBAudioDeviceBase& activeInstance() { return *s_active_; }
 
-  /** @brief Returns true if the IN endpoint is enabled. */
-  inline bool isEpInEnabled() const { return config_.enable_ep_in; }
 
-  /** @brief Returns true if the OUT endpoint is enabled. */
-  inline bool isEpOutEnabled() const { return config_.enable_ep_out; }
-
-  /** @brief Returns true if the feedback endpoint is enabled.
-   *  Only meaningful in pure RX (OUT-only) mode: with an IN endpoint present
-   *  the host uses the TX stream as implicit feedback instead. */
+  /** @brief Returns true if the feedback endpoint is enabled: RX-only mode,
+   *  or RXTX mode with enable_feedback_ep_rxtx.  When false the OUT endpoint
+   *  (if any) is adaptive, ie: the host ignores the device's clock, and the
+   *  setFeedback*() calls have no effect. */
   bool isFeedbackEpEnabled() const { return descr_builder.enableFeedbackEp(); }
 
   /** @brief Returns true if IN endpoint flow control is enabled. When on, the
@@ -405,91 +367,10 @@ public:
     return config_.enable_ep_in_flow_control;
   }
 
-  // ── Volume / Mute / Sample-rate API ─────────────────────────────────────
 
-  /// gets the volume for the master channel (channel 0)
-  float volume() override { return volume(0); }
-
-  /// sets the volume for the master channel (channel 0)
-  bool setVolume(float volume) override { return setVolume(volume, 0); }
-
-  /** @brief Returns the current volume for the given channel.
-   *  @param channel  0 = master, 1..N = per-channel.
-   *  @return Volume as a float in the range 0.0 (silence) to 1.0 (0 dB). */
-  float volume(uint8_t channel) {
-    return (channel < volume_.size()) ? volume_[channel] : 0.0f;
-  }
-
-  /** @brief Set the volume for a channel and notify the host.
-   *  @param vol      Volume as a float 0.0 (silence) to 1.0 (0 dB).
-   *  @param channel  0 = master, 1..N = per-channel.
-   *  @return true if the channel index was valid. */
-  bool setVolume(float vol, uint8_t channel) {
-    LOGW("setVolume %f channel: %d", vol, channel);
-    if (channel >= volume_.size()) return false;
-    volume_[channel] = vol;
-    if (volume_cb_) volume_cb_(vol, channel);
-    sendInterruptNotification(AUDIO_FU_CTRL_VOLUME, channel,
-                              USBAudio2DescriptorBuilder::ENTITY_FU1);
-    return true;
-  }
-
-  /** @brief Returns the current mute state for the given channel.
-   *  @param channel  0 = master, 1..N = per-channel. */
-  bool isMute(uint8_t channel = 0) const {
-    return (channel < mute_.size()) ? mute_[channel] : false;
-  }
-
-  /** @brief Set the mute state for a channel and notify the host.
-   *  @param m        true = muted, false = unmuted.
-   *  @param channel  0 = master, 1..N = per-channel.
-   *  @return true if the channel index was valid. */
-  bool setMute(bool m, uint8_t channel = 0) {
-    LOGW("setMute %s channel: %d", m ? "true" : "false", channel);
-    if (channel >= mute_.size()) return false;
-    mute_[channel] = m;
-    if (mute_cb_) mute_cb_(m, channel);
-    sendInterruptNotification(AUDIO_FU_CTRL_MUTE, channel,
-                              USBAudio2DescriptorBuilder::ENTITY_FU1);
-    return true;
-  }
-
-  /** @brief Register a callback invoked when the host (or device) changes
-   *         the volume.
-   *  @param cb  Callback receiving (float volume, uint8_t channel). */
-  void setVolumeCallback(std::function<void(float, uint8_t)> cb) {
-    volume_cb_ = std::move(cb);
-  }
-
-  /** @brief Register a callback invoked when the host (or device) changes
-   *         the mute state.
-   *  @param cb  Callback receiving (bool muted, uint8_t channel). */
-  void setMuteCallback(std::function<void(bool, uint8_t)> cb) {
-    mute_cb_ = std::move(cb);
-  }
-
-  /** @brief Register a callback invoked when the host (or device) changes
-   *         the sample rate.
-   *  @param cb  Callback receiving the new rate in Hz. */
-  void setSampleRateCallback(std::function<void(uint32_t)> cb) {
-    sample_rate_cb_ = std::move(cb);
-  }
-
-  /** @brief Register a callback invoked when the streaming state changes.
-   *  Fires when the host opens or closes a streaming interface (SET_INTERFACE
-   *  alt=1 / alt=0).
-   *  @param cb  Callback receiving (bool active_tx, bool active_rx). */
-  void setStreamingStateCallback(std::function<void(bool, bool)> cb) {
-    streaming_state_cb_ = std::move(cb);
-  }
-
-  /** @brief Returns true if either IN or OUT streaming endpoint is open. */
-  bool isStreamingActive() const {
-    return isStreamingActiveTx() || isStreamingActiveRx();
-  }
 
   /** @brief Returns true if the host has opened the IN (capture) stream. */
-  bool isStreamingActiveTx() const {
+  bool isStreamingActiveTx() const override {
     for (const auto& fct : audiod_fct_) {
       if (fct.ep_in != 0) return true;
     }
@@ -497,7 +378,7 @@ public:
   }
 
   /** @brief Returns true if the host has opened the OUT (playback) stream. */
-  bool isStreamingActiveRx() const {
+  bool isStreamingActiveRx() const override {
     for (const auto& fct : audiod_fct_) {
       if (fct.ep_out != 0) return true;
     }
@@ -510,7 +391,7 @@ public:
   uint8_t getAudioCount() const { return 1; }
 
   /** @brief Returns true if the device is mounted by the USB host. */
-  bool mounted() { return backend().mounted(); }
+  bool mounted() override { return backend().mounted(); }
 
   /**
    * @brief Register a callback for GET requests on the interface.
@@ -665,87 +546,51 @@ public:
    * min feedback value), 100 asks it to speed up (max value), and 50
    * approximates the nominal sample rate.
    *
+   * Only has an effect when isFeedbackEpEnabled(); see
+   * enable_feedback_ep_rxtx for RXTX mode.
+   *
+   * Each step is 1% of a +-1 sample per frame range (eg: ~420 ppm at 48 kHz),
+   * much coarser than typical clock differences; see setFeedbackPpm() for
+   * finer control.
+   *
    * @param percent 0..100; values above 100 are clamped.
    */
   void setFeedbackPercent(int percent) {
     int normalized = percent;
     if (normalized < 0) normalized = 0;
     if (normalized > 100) normalized = 100;
+    manual_feedback_ppm_ = INT32_MIN;
     manual_feedback_percent_ = normalized;
   }
 
-  /** @brief Reverts setFeedbackPercent() and restores the automatic
-   *  (FIFO_COUNT) feedback computation. */
-  void setFeedbackAutomatic() { manual_feedback_percent_ = -1; }
-
-  /** @brief Send audio data to the host (device → host, microphone/capture).
-   *  Silently discards data when the host has not opened the capture device
-   *  (alt=0) so StreamCopy doesn't report write errors before recording. */
-  size_t write(const uint8_t* data, size_t len) {
-    if (!is_started_) return 0;
-    serviceUSB();
-
-    // disregard data if the host has not opened the capture device (alt=0)
-    if (!isStreamingActiveTx()) return len;
-
-    // update the volume
-    if (config_.volume_active) processVolume((uint8_t*)data, len);
-
-    // Write all data, retrying if the buffer is full.  On single-core
-    // platforms (RP2040), serviceUSB() drains the buffer by running
-    // tud_task() → xfer_cb.  On dual-core (ESP32), the USB task drains
-    // independently and the SynchronizedNBufferRTOS blocks internally.
-    size_t written = 0;
-    while (written < len) {
-      int n = bufferTx().writeArray(data + written, len - written);
-      written += n;
-      if (written < len) {
-        serviceUSB();  // drain buffer to make space
-        if (!isStreamingActiveTx()) break;  // host stopped
-      }
+  /**
+   * @brief Like setFeedbackPercent(), but as an offset from the nominal
+   * sample rate in parts per million: positive asks the host to send faster,
+   * negative slower.  Resolution is the feedback format's (~0.3 ppm at
+   * 48 kHz full speed), so a control loop on the application's own buffer
+   * level can match the host's rate closely.  Clamped to the negotiated
+   * +-1 sample per frame range.  Only has an effect when
+   * isFeedbackEpEnabled().
+   */
+  void setFeedbackPpm(int32_t ppm) {
+    if (ppm == INT32_MIN) ppm = INT32_MIN + 1;
+    // The offset is computed here, not in the SOF interrupt, to keep the
+    // 64 bit divide out of it.
+    for (uint8_t i = 0; i < getAudioCount(); i++) {
+      audiod_function_t* audio = &audiod_fct_[i];
+      audio->feedback.ppm_offset = feedbackPpmOffset(audio, ppm);
     }
-    return written;
+    manual_feedback_percent_ = -1;
+    manual_feedback_ppm_ = ppm;
   }
 
-  /** @brief Receive audio data from the host (host → device, speaker/playback).
-   *  Until bufferRx() has filled past config.rx_start_fill_percent at least
-   *  once after begin(), no data is returned. This is a one-shot startup
-   *  prime only -- once reached, readBytes() keeps draining normally for the
-   *  rest of the session and is not gated again by later underruns. */
-  size_t readBytes(uint8_t* buffer, size_t bufsize) {
-    if (!is_started_) return 0;
-    serviceUSB();
-
-    if (!rx_primed_) {
-      uint8_t start_fill = config_.rx_start_fill_percent > 100
-                               ? 100
-                               : config_.rx_start_fill_percent;
-      if (start_fill > 0 && bufferRx().levelPercent() < start_fill) return 0;
-      rx_primed_ = true;
-    }
-
-    // get the data from the buffer
-    size_t ret = bufferRx().readArray(buffer, bufsize);
-    // upate the volume
-    if (config_.volume_active) processVolume(buffer, ret);
-
-    return ret;
+  /** @brief Reverts setFeedbackPercent()/setFeedbackPpm() and restores the
+   *  automatic (FIFO_COUNT) feedback computation. */
+  void setFeedbackAutomatic() {
+    manual_feedback_percent_ = -1;
+    manual_feedback_ppm_ = INT32_MIN;
   }
 
-  /** @brief Bytes of received audio waiting in the RX buffer. */
-  int available() override {
-    if (!is_started_) return 0;
-    return bufferRx().available();
-  }
-
-  /** @brief Bytes of free space in the TX buffer. */
-  int availableForWrite() override {
-    if (!is_started_) return 0;
-    return bufferTx().availableForWrite();
-  }
-
-  /// Returns true when begin() has been called and the USB host has mounted the device.
-  operator bool() override { return is_started_ && mounted(); }
 
   /** @brief Stop audio streaming and clear buffers. Does not disconnect USB. */
   void end() {
@@ -828,12 +673,9 @@ public:
     return audiod_fct_.empty() ? 0 : audiod_fct_[0].interval_tx;
   }
 
-  /// Returns the actual core on which the call is running (for RP2040)
   virtual int getActualCore() const { return -1;}
 
  protected:
-  bool is_started_ = false;
-  bool usb_task_active_ = false;  // true while a dedicated tud_task() FreeRTOS task is running
   bool tx_xfer_armed_ = false;
   volatile uint32_t xfer_cb_tx_count_ = 0;
   volatile uint32_t tx_fifo_read_total_ = 0;
@@ -842,18 +684,6 @@ public:
   volatile uint32_t rx_dropped_bytes_ = 0;
   volatile uint16_t tx_frame_bytes_last_ = 0;
   volatile uint32_t tx_xferred_last_ = 0;
-  int core = -1;
-  bool rx_primed_ = false;
-
-  bool is_active_ = false;
-  // ── Volume / mute state (sized to channels+1 in begin()) ─────────────────
-  std::vector<float> volume_;
-  std::vector<bool> mute_;
-  std::function<void(float, uint8_t)> volume_cb_;
-  std::function<void(bool, uint8_t)> mute_cb_;
-  std::function<void(uint32_t)> sample_rate_cb_;
-  std::function<void(bool, bool)> streaming_state_cb_;
-  USBAudioConfig config_;
   USBAudioConfig active_config_;
   USBAudio2DescriptorBuilder descr_builder{config_};
   std::function<void(USBAudioDeviceBase*, uint8_t rhport)> int_done_cb_;
@@ -906,6 +736,14 @@ public:
   // the caller is driving the feedback value directly via
   // setFeedbackPercent(). See tud_audio_feedback_interval_isr().
   int16_t manual_feedback_percent_ = -1;
+  // setFeedbackPpm() override, or INT32_MIN for none.
+  volatile int32_t manual_feedback_ppm_ = INT32_MIN;
+  // enable_ep_in_rate_tracking: frames to wait before the next correction.
+  uint8_t tx_rate_holdoff_ = 0;
+  // enable_ep_in_rate_tracking: false until bufferTx() first fills to the
+  // target level; then the smoothed level, in frames, Q8.
+  bool tx_rate_armed_ = false;
+  int32_t tx_level_avg_ = 0;
 
   // calculate!
   std::vector<uint16_t> desc_len_;
@@ -918,8 +756,6 @@ public:
   // trampoline reach the last-constructed instance without a singleton.
   inline static USBAudioDeviceBase* s_active_ = nullptr;
 
-  /// Set the USB audio configuration (use begin(cfg) instead).
-  void setConfig(const USBAudioConfig& cfg) { config_ = cfg; }
 
   /** @brief Process pending USB events on platforms where the application
    *         drives the stack (RP2040, STM32, ...). Skipped when a dedicated
@@ -935,60 +771,13 @@ public:
    *         stack's event loop is inherently stack-specific and has no
    *         equivalent on a native-HAL backend, so it is not part of
    *         USBAudioBackend. */
-  virtual void serviceUSB() = 0;
+  void serviceUSB() override = 0;
 
   /** @brief Returns the backend used for all raw USB-stack calls (TinyUSB
    *  today, or a future native-HAL backend). Must be overridden by every
    *  platform subclass; the returned reference must outlive this object. */
   virtual USBAudioBackend& backend() = 0;
 
-  /** @brief Returns the TX audio buffer.  Must be overridden by subclasses. */
-  virtual BaseBuffer<uint8_t>& bufferTx() = 0;
-
-  /** @brief Returns the RX audio buffer.  Must be overridden by subclasses. */
-  virtual BaseBuffer<uint8_t>& bufferRx() = 0;
-
-  /** @brief Process audio data for volume control. */
-  void processVolume(uint8_t* data, size_t len) {
-    switch (config_.bits_per_sample) {
-      case 8:
-        processVolume<int8_t>((int8_t*)data, len);
-        break;
-      case 16:
-        processVolume<int16_t>((int16_t*)data, len / 2);
-        break;
-      case 24:
-        processVolume<int24_3bytes_t>((int24_3bytes_t*)data, len / 3);
-        break;
-      case 32:
-        processVolume<int32_t>((int32_t*)data, len / 4);
-        break;
-      default:
-        // Unsupported bit depth; do nothing.
-        break;
-    }
-  }
-
-  /** @brief Returns the effective volume for a per-channel index (1-based).
-   *  Combines master volume (index 0) with per-channel volume and mute. */
-  float getVolumeExt(uint8_t channel) const {
-    if (volume_.empty()) return 1.0f;
-    if (mute_[0]) return 0.0f;  // master mute
-    float master = volume_[0];
-    if (channel >= volume_.size()) return master;  // no per-channel entry
-    if (mute_[channel]) return 0.0f;               // per-channel mute
-    return master * volume_[channel];
-  }
-
-  template <typename T>
-  void processVolume(T* data, size_t sample_count) {
-    uint8_t ch_count = config_.channels;
-    for (size_t i = 0; i < sample_count; i++) {
-      uint8_t ch = (uint8_t)(i % ch_count) + 1;  // 1-based per-channel index
-      float vol = getVolumeExt(ch);
-      data[i] = (T)(data[i] * vol);
-    }
-  }
 
   /** @brief Device-initiated sample rate change.
    *
@@ -1012,38 +801,16 @@ public:
                               USBAudio2DescriptorBuilder::ENTITY_CLOCK);
   }
 
-  /** @brief Override in platform subclasses to register descriptors and start
-   *         the USB host-controller stack (e.g. USB.begin() on ESP32).
-   *         Called at the end of begin(cfg, info).  The base no-op is correct
-   *         for RP2040 where TinyUSB is started by the system before setup().*/
-  virtual bool beginUSB() = 0;
-
-  /** @brief Resize the platform audio buffers.
-   *  Both platforms use NBuffer-style block pools:
-   *  block size = max USB packet, block count = fifo_packets.
-   *  ESP32: SynchronizedNBufferRTOS (FreeRTOS queues, cross-core safe).
-   *  RP2040: NBuffer (single-core, no synchronization needed). */
-  virtual void resizeBuffers() = 0;
-
-  /** @brief Convert AudioTools volume (0.0–1.0) to UAC2 int16 (1/256 dB).
-   *  0.0 maps to 0x8000 (silence), 1.0 maps to 0 (0 dB). */
-  static constexpr int16_t kVolumeMinDb256 = -25600;  // -100 dB in 1/256 dB
-
-  /** @brief Convert linear volume (0.0–1.0) to UAC2 int16 (1/256 dB).
-   *  Linear mapping: 0.0 → -100 dB (min), 1.0 → 0 dB (max). */
-  static int16_t floatToUac2(float vol) {
-    if (vol <= 0.0f) return (int16_t)0x8000;
-    if (vol >= 1.0f) return 0;
-    return (int16_t)((1.0f - vol) * kVolumeMinDb256);
+  /// Notify the host about a device-initiated volume change.
+  void onVolumeChanged(uint8_t channel) override {
+    sendInterruptNotification(AUDIO_FU_CTRL_VOLUME, channel,
+                              USBAudio2DescriptorBuilder::ENTITY_FU1);
   }
 
-  /** @brief Convert UAC2 int16 (1/256 dB) to linear volume (0.0–1.0).
-   *  Linear mapping within the -100..0 dB range reported by GET_RANGE. */
-  static float uac2ToFloat(int16_t v) {
-    if (v == (int16_t)0x8000) return 0.0f;
-    if (v >= 0) return 1.0f;
-    if (v <= kVolumeMinDb256) return 0.0f;
-    return 1.0f - (float)v / (float)kVolumeMinDb256;
+  /// Notify the host about a device-initiated mute change.
+  void onMuteChanged(uint8_t channel) override {
+    sendInterruptNotification(AUDIO_FU_CTRL_MUTE, channel,
+                              USBAudio2DescriptorBuilder::ENTITY_FU1);
   }
 
   /** @brief Returns true if the given entity ID is a Feature Unit (FU1 or FU2).
@@ -1076,8 +843,6 @@ public:
     }
   }
 
-  bool configChanged(const USBAudioConfig& n) { return config_ != n; }
-
   // Returns the control buffer size for a given function number
   uint16_t getCtrlBufSz(uint8_t fn) const {
     return (fn < ctrl_buf_sz_.size()) ? ctrl_buf_sz_[fn] : 64;
@@ -1086,15 +851,6 @@ public:
   // Returns the descriptor length for a given function number
   uint16_t getDescLen(uint8_t fn) const {
     return (fn < desc_len_.size()) ? desc_len_[fn] : 0;
-  }
-
-  static bool isValidBitsPerSample(uint8_t bps) {
-    return bps == 16 || bps == 24 || bps == 32;
-  }
-
-  void notifyStreamingState() {
-    if (streaming_state_cb_)
-      streaming_state_cb_(isStreamingActiveTx(), isStreamingActiveRx());
   }
 
   // Max Bytes for one 1 ms isochronous USB packet.
@@ -1107,21 +863,35 @@ public:
            sizeof(((audiod_function_t*)0)->ctrl_buf_sz);
   }
 
-  // Called by audiod_sof_isr() at the feedback interval.
-  // Computes the current feedback value then claims the EP and sends it.
+  // Called by audiod_sof_isr() at the feedback interval, in the USB
+  // interrupt.  Only computes the feedback value: sending it means claiming
+  // the endpoint, which takes TinyUSB's endpoint mutex, and doing that here
+  // deadlocks if the interrupt arrived while the TinyUSB task held it.  The
+  // value is sent from task context instead, each time the previous feedback
+  // transfer completes (audiod_xfer_cb()), as TinyUSB's own audio driver does.
   void tud_audio_feedback_interval_isr(uint8_t func_id,
                                        uint32_t /*frame_count*/,
                                        uint8_t frame_shift) {
     audiod_function_t* audio = &audiod_fct_[func_id];
+    // Computed here and stored to audio->feedback.value once: it's read
+    // from task context (audiod_fb_send()), which mustn't see a value
+    // that's only partly computed (eg: before clamping).
+    uint32_t value = audio->feedback.value;
 
-    if (manual_feedback_percent_ >= 0) {
+    if (manual_feedback_ppm_ != INT32_MIN) {
+      // setFeedbackPpm() override: offset from the nominal rate.
+      int32_t offset = audio->feedback.ppm_offset;
+      value = offset < 0 && (uint32_t)-offset > audio->feedback.nom_value
+                  ? 0
+                  : audio->feedback.nom_value + offset;
+      value = clampFeedback(audio, value);
+    } else if (manual_feedback_percent_ >= 0) {
       // setFeedbackPercent() override: scale linearly across the negotiated
       // [min_value, max_value] range instead of running the automatic
       // compute_method below.
       uint32_t range = audio->feedback.max_value - audio->feedback.min_value;
-      audio->feedback.value =
-          audio->feedback.min_value +
-          (range * (uint32_t)manual_feedback_percent_) / 100;
+      value = audio->feedback.min_value +
+              (range * (uint32_t)manual_feedback_percent_) / 100;
     } else {
       switch (audio->feedback.compute_method) {
         case AUDIO_FEEDBACK_METHOD_FIFO_COUNT: {
@@ -1147,49 +917,64 @@ public:
             uint32_t drop =
                 (uint32_t)audio->feedback.compute.fifo_count.rate_const[1] *
                 (avg - thr);
-            audio->feedback.value =
-                (nom > drop) ? nom - drop : audio->feedback.min_value;
+            value = (nom > drop) ? nom - drop : audio->feedback.min_value;
           } else {
             // Buffer emptier than the target level: ask the host to speed
             // up. rate_const[0] is scaled so avg==0 (empty) maps exactly to
             // max_value.
-            audio->feedback.value =
-                nom +
-                (uint32_t)audio->feedback.compute.fifo_count.rate_const[0] *
-                    (thr - avg);
+            value = nom +
+                    (uint32_t)audio->feedback.compute.fifo_count.rate_const[0] *
+                        (thr - avg);
           }
-          uint32_t clamped = audio->feedback.value < audio->feedback.min_value
-                                ? audio->feedback.min_value
-                                : audio->feedback.value;
-          audio->feedback.value = clamped > audio->feedback.max_value
-                                      ? audio->feedback.max_value
-                                      : clamped;
+          value = clampFeedback(audio, value);
         } break;
 
         case AUDIO_FEEDBACK_METHOD_FREQUENCY_POWER_OF_2:
-          audio->feedback.value = 1UL << audio->feedback.compute.power_of_2;
+          value = 1UL << audio->feedback.compute.power_of_2;
           break;
 
         case AUDIO_FEEDBACK_METHOD_FREQUENCY_FLOAT:
-          audio->feedback.value =
-              (uint32_t)(audio->feedback.compute.float_const *
-                         (float)(1UL << (16u - (frame_shift - 1u))));
+          value = (uint32_t)(audio->feedback.compute.float_const *
+                             (float)(1UL << (16u - (frame_shift - 1u))));
           break;
 
         case AUDIO_FEEDBACK_METHOD_FREQUENCY_FIXED: {
           uint32_t frame_div = backend().isFullSpeed() ? 1000u : 8000u;
-          audio->feedback.value =
-              (audio->feedback.compute.fixed.sample_freq << 16) / frame_div;
+          value = (audio->feedback.compute.fixed.sample_freq << 16) / frame_div;
         } break;
 
         default:
           break;
       }
     }
+    audio->feedback.value = value;
+  }
 
-    if (backend().claimEndpoint(audio->rhport, audio->ep_fb)) {
-      audiod_fb_send(audio);
-    }
+  static uint32_t clampFeedback(const audiod_function_t* audio,
+                                uint32_t value) {
+    if (value < audio->feedback.min_value) return audio->feedback.min_value;
+    if (value > audio->feedback.max_value) return audio->feedback.max_value;
+    return value;
+  }
+
+  // setFeedbackPpm()'s offset from feedback.nom_value, in 16.16 format.
+  static int32_t feedbackPpmOffset(const audiod_function_t* audio,
+                                   int32_t ppm) {
+    return (int32_t)((int64_t)audio->feedback.nom_value * ppm / 1000000);
+  }
+
+  // Queues a feedback transfer with the latest value, unless one is already
+  // queued.  Task context only (see tud_audio_feedback_interval_isr()).
+  // Called when the OUT stream opens, when each feedback transfer
+  // completes, and, so that a broken chain (eg: a failed transfer) restarts,
+  // when each OUT packet arrives.
+  void audiod_fb_kick(audiod_function_t* audio) {
+    if (!audio->ep_fb || audio->ep_fb_xfer) return;
+    if (!backend().claimEndpoint(audio->rhport, audio->ep_fb)) return;
+    if (audiod_fb_send(audio))
+      audio->ep_fb_xfer = audio->ep_fb;
+    else
+      backend().releaseEndpoint(audio->rhport, audio->ep_fb);
   }
 
   // USBD Driver API — public so a backend's class-driver registration glue
@@ -1530,12 +1315,16 @@ public:
         // 44.1/48kHz vs. 32kHz).
         (void)backend().transfer(rhport, audio->ep_out,
                                  audio->lin_buf_out.data(), audio->ep_out_sz);
+        if (isFeedbackEpEnabled()) audiod_fb_kick(audio);
         if (rx_done_cb_)
           rx_done_cb_(this, rhport, audio, (uint16_t)xferred_bytes);
         return true;
       }
-      if (isFeedbackEpEnabled() && audio->ep_fb == ep_addr) {
-        // SOF ISR owns re-sending; just notify the application.
+      if (isFeedbackEpEnabled() && audio->ep_fb_xfer == ep_addr) {
+        // Queue the next feedback packet with the latest value (unless the
+        // stream has closed), before the callback: see the OUT case above.
+        audio->ep_fb_xfer = 0;
+        audiod_fb_kick(audio);
         if (fb_done_cb_) fb_done_cb_(this, func_id);
         return true;
       }
@@ -2089,6 +1878,9 @@ public:
                       const UsbEndpointDescriptorView& desc_ep) {
     audio->ep_fb = desc_ep.bEndpointAddress;
     audio->feedback.frame_shift = desc_ep.bInterval - 1;
+    // Activating the endpoint (just done) aborted any transfer still queued
+    // from the last time the stream was open.
+    audio->ep_fb_xfer = 0;
   }
 
   // ── Configure feedback computation parameters ─────────────────────────
@@ -2109,6 +1901,11 @@ public:
     uint32_t const frame_div = backend().isFullSpeed() ? 1000 : 8000;
     audio->feedback.min_value = ((fb_param.sample_freq - 1) / frame_div) << 16;
     audio->feedback.max_value = (fb_param.sample_freq / frame_div + 1) << 16;
+    audio->feedback.nom_value =
+        (uint32_t)(((uint64_t)fb_param.sample_freq << 16) / frame_div);
+    if (manual_feedback_ppm_ != INT32_MIN)
+      audio->feedback.ppm_offset =
+          feedbackPpmOffset(audio, manual_feedback_ppm_);
 
     switch (fb_param.method) {
       case AUDIO_FEEDBACK_METHOD_FREQUENCY_FIXED:
@@ -2211,6 +2008,15 @@ public:
           tud_audio_set_itf_cb_(this, rhport, UsbSetupPacket{});
 
         setupFeedback(audio, func_id, alt);
+        // Start the feedback transfers when the OUT stream opens; each
+        // completion queues the next.  Until the SOF interrupt has computed
+        // a value, send the nominal one.
+        if (isFeedbackEpEnabled() && audio->ep_fb &&
+            audio->ep_out_as_intf_num == itf) {
+          if (audio->feedback.value == 0)
+            audio->feedback.value = audio->feedback.nom_value;
+          audiod_fb_kick(audio);
+        }
         return true;
       }
       p_desc = descNext(p_desc);
@@ -2321,6 +2127,8 @@ public:
 
     // Restart the fractional accumulator for this streaming session.
     audio->tx_sample_acc = 0;
+    tx_rate_holdoff_ = 0;
+    tx_rate_armed_ = false;
 
     bool full_speed = backend().isFullSpeed();
     const uint8_t interval =
@@ -2379,11 +2187,45 @@ public:
     const uint32_t interval = full_speed ? iv : (1u << (iv - 1));
 
     audio->tx_sample_acc += audio->sample_rate_tx * interval;
-    const uint32_t samples = audio->tx_sample_acc / denom;
+    uint32_t samples = audio->tx_sample_acc / denom;
     audio->tx_sample_acc -= samples * denom;
 
-    uint32_t bytes =
-        samples * audio->n_channels_tx * audio->n_bytes_per_sample_tx;
+    const uint32_t frame_bytes =
+        audio->n_channels_tx * audio->n_bytes_per_sample_tx;
+    if (config_.enable_ep_in_rate_tracking) {
+      // Asynchronous IN: the application writes bufferTx() at the device's
+      // clock, which differs slightly from the host's.  Follow it by sending
+      // one sample more when the buffer is above half full, one less when
+      // below.  Corrections start once the buffer has first filled to half
+      // (so not while the application is still filling it), and use the
+      // smoothed level (so not on the jitter from the application writing
+      // in blocks).  The hold-off, longer than the smoothing's time
+      // constant, stops a correction being repeated before the average
+      // shows it, and limits the rate to 1 sample per 33 packets, ie:
+      // 630 ppm at 48 kHz, far more than any crystal's error.
+      const int32_t level = (int32_t)(bufferTx().available() / frame_bytes);
+      const int32_t target = (int32_t)(bufferTx().size() / frame_bytes / 2);
+      if (!tx_rate_armed_) {
+        if (level >= target) {
+          tx_rate_armed_ = true;
+          tx_level_avg_ = level * 256;
+        }
+      } else {
+        // Exponential moving average, time constant 16 packets.
+        tx_level_avg_ += (level * 256 - tx_level_avg_) / 16;
+        if (tx_rate_holdoff_) {
+          tx_rate_holdoff_--;
+        } else if (tx_level_avg_ > (target + 1) * 256) {
+          samples++;
+          tx_rate_holdoff_ = 32;
+        } else if (tx_level_avg_ < (target - 1) * 256 && samples > 1) {
+          samples--;
+          tx_rate_holdoff_ = 32;
+        }
+      }
+    }
+
+    uint32_t bytes = samples * frame_bytes;
     if (bytes > audio->ep_in_sz) bytes = audio->ep_in_sz;
     return (uint16_t)bytes;
   }

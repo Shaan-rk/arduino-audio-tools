@@ -18,6 +18,8 @@
 /// values make the point at which data_length is reached more precise (see
 /// WAVEncoder::write()) at the cost of more, smaller writes to the encoder.
 #define WAV_ENCODER_COMPRESSED_CHUNK_SIZE 1024
+/// Maximum size of the codec specific data of the 'fmt ' chunk that we keep
+#define MAX_WAV_EXTRA_DATA_LEN 64
 
 namespace audio_tools {
 
@@ -123,6 +125,8 @@ class WAVHeader {
     headerInfo.byte_rate = read_int32();
     headerInfo.block_align = read_int16();
     headerInfo.bits_per_sample = read_int16();
+    extradata.clear();
+    if (fmt_length >= 18) parseFormatExtension(fmt_length);
     if (!setPos("data")) return false;
     headerInfo.data_length = read_int32();
     if (headerInfo.data_length == 0 || headerInfo.data_length >= 0x7fff0000) {
@@ -161,6 +165,12 @@ class WAVHeader {
 
   /// provides the info from the header
   WAVAudioInfo &audioInfo() { return headerInfo; }
+
+  /// Provides the codec specific data that follows the standard fields of
+  /// the 'fmt ' chunk (e.g. the ATRAC3 extradata). For
+  /// WAVE_FORMAT_EXTENSIBLE the 22 byte extension (valid bits, channel mask
+  /// and sub format GUID) is not included.
+  Vector<uint8_t> &extraData() { return extradata; }
 
   /// Sets the info in the header
   void setAudioInfo(WAVAudioInfo info) { headerInfo = info; }
@@ -212,6 +222,7 @@ class WAVHeader {
     empty.channels = 0;
     empty.bits_per_sample = 0;
     headerInfo = empty;
+    extradata.clear();
     buffer.setClearWithZero(true);
     buffer.reset();
   }
@@ -232,8 +243,41 @@ class WAVHeader {
 
  protected:
   WAVAudioInfo headerInfo;
+  Vector<uint8_t> extradata;
   SingleBuffer<uint8_t> buffer{MAX_WAV_HEADER_LEN};
   size_t data_pos = 0;
+
+  /// Reads cbSize and the extradata of the 'fmt ' chunk. For
+  /// WAVE_FORMAT_EXTENSIBLE the format is replaced by the one that is
+  /// identified by the sub format GUID (if we know it).
+  void parseFormatExtension(int fmt_length) {
+    int max_size = fmt_length - 18;
+    int size = read_int16();
+    if (size > max_size) size = max_size;
+    if (size > MAX_WAV_EXTRA_DATA_LEN) size = MAX_WAV_EXTRA_DATA_LEN;
+    if (headerInfo.format == AudioFormat::EXTENSIBLE && size >= 22) {
+      skip(6);  // valid bits per sample, channel mask
+      uint8_t guid[16];
+      for (int j = 0; j < 16; j++) guid[j] = getChar();
+      headerInfo.format = formatFromGuid(guid);
+      size -= 22;
+    }
+    extradata.resize(size);
+    for (int j = 0; j < size; j++) extradata[j] = getChar();
+  }
+
+  /// Maps the sub format GUID of WAVE_FORMAT_EXTENSIBLE to a format
+  static AudioFormat formatFromGuid(const uint8_t *guid) {
+    static const uint8_t atrac3plus[16] = {0xBF, 0xAA, 0x23, 0xE9, 0x58, 0xCB,
+                                           0x71, 0x44, 0xA1, 0x19, 0xFF, 0xFA,
+                                           0x01, 0xE4, 0xCE, 0x62};
+    static const uint8_t atrac9[16] = {0xD2, 0x42, 0xE1, 0x47, 0xBA, 0x36,
+                                       0x8D, 0x4D, 0x88, 0xFC, 0x61, 0x65,
+                                       0x4F, 0x8C, 0x83, 0x6C};
+    if (memcmp(guid, atrac3plus, 16) == 0) return AudioFormat::ATRAC3_PLUS;
+    if (memcmp(guid, atrac9, 16) == 0) return AudioFormat::ATRAC9;
+    return AudioFormat::EXTENSIBLE;
+  }
 
   bool setPos(const char *id) {
     int id_len = strlen(id);
@@ -537,6 +581,7 @@ class WAVDecoder : public AudioDecoder {
     byte_buffer.reset();
     buffer24.reset();
     buffer_float16.reset();
+    data_bytes_remaining = 0;
     isFirst = true;
     active = true;
     return true;
@@ -596,20 +641,33 @@ class WAVDecoder : public AudioDecoder {
     TRACED();
     size_t result = 0;
     if (active) {
+      size_t data_start = 0;
       if (isFirst) {
-        int data_start = decodeHeader((uint8_t *)data, len);
+        int header_size = decodeHeader((uint8_t *)data, len);
         // we do not have the complete header yet: need more data
-        if (data_start == 0) return len;
-        // process the outstanding data - only if the format is supported;
-        // otherwise report 0 bytes written, consistent with subsequent
-        // write() calls once the format has been found to be invalid
-        if (isValid) {
-          result = data_start +
-                   write_out((uint8_t *)data + data_start, len - data_start);
+        if (header_size == 0) return len;
+        data_start = header_size;
+      }
+      // process the outstanding data - only if the format is supported;
+      // otherwise report 0 bytes written, consistent with subsequent
+      // write() calls once the format has been found to be invalid
+      if (isValid) {
+        size_t audio_size = len - data_start;
+        // never play the bytes after the declared 'data' chunk (e.g. trailing
+        // LIST/id3 chunks); streamed files have no declared length
+        if (!header.audioInfo().is_streamed) {
+          audio_size = min(audio_size, (size_t)data_bytes_remaining);
         }
-
-      } else if (isValid) {
-        result = write_out((uint8_t *)data, len);
+        size_t written = write_out((uint8_t *)data + data_start, audio_size);
+        if (!header.audioInfo().is_streamed) {
+          data_bytes_remaining -= min((size_t)data_bytes_remaining, written);
+        }
+        result = data_start + written;
+        if (written == audio_size) {
+          // everything we are interested in was written: report the complete
+          // input as consumed (bytes after the data chunk are ignored)
+          result = len;
+        }
       }
     }
     return result;
@@ -660,6 +718,8 @@ class WAVDecoder : public AudioDecoder {
   bool isFirst = true;
   bool isValid = true;
   bool active = false;
+  /// bytes of the declared 'data' chunk that are still to be decoded
+  uint32_t data_bytes_remaining = 0;
   /// decoder matching the format of the WAV file currently being processed
   /// (selected in decodeHeader() from the registered decoders)
   AudioDecoderExt *p_decoder = nullptr;
@@ -757,9 +817,7 @@ class WAVDecoder : public AudioDecoder {
       if (byte_buffer.isFull()) {
         float sample_f;
         memcpy(&sample_f, byte_buffer.data(), sizeof(sample_f));
-        if (sample_f > 1.0f) sample_f = 1.0f;
-        if (sample_f < -1.0f) sample_f = -1.0f;
-        buffer_float16.write((int16_t)(sample_f * 32767.0f));
+        buffer_float16.write(NumberConverter::fromFloatT<int16_t>(sample_f));
         if (buffer_float16.isFull()) {
           writeDataT<int16_t>(&out(), buffer_float16.data(),
                                buffer_float16.available());
@@ -837,7 +895,12 @@ class WAVDecoder : public AudioDecoder {
   }
 
   /// Decodes the header data: Returns the start pos of the data
+  /// Returns the start of the audio data relative to `in_ptr` (0: header
+  /// not complete yet)
   int decodeHeader(uint8_t *in_ptr, size_t in_size) {
+    // bytes of earlier writes that are already in the header buffer: the
+    // data position found below is relative to the start of that buffer
+    int buffered_before = (int)header.available();
     // we expect at least the full header
     header.write(in_ptr, in_size);
     if (!header.isDataComplete()) {
@@ -858,6 +921,8 @@ class WAVDecoder : public AudioDecoder {
       header.dumpHeader();
       return 0;
     }
+    // determine the data start before parse(), which consumes the buffer
+    int data_start = header.getDataPos();
     // parse header
     if (!header.parse()) {
       LOGE("WAV header parsing failed");
@@ -869,6 +934,7 @@ class WAVDecoder : public AudioDecoder {
     LOGI("WAV sample_rate: %d", (int)header.audioInfo().sample_rate);
     LOGI("WAV data_length: %u", (unsigned)header.audioInfo().data_length);
     LOGI("WAV is_streamed: %d", header.audioInfo().is_streamed);
+    data_bytes_remaining = header.audioInfo().data_length;
 
     // select the decoder matching the format found in the header (if any
     // was registered via setDecoder()/addDecoder()); otherwise fall back to
@@ -881,6 +947,8 @@ class WAVDecoder : public AudioDecoder {
         // update blocksize before begin() is called in setupEncodedAudio()
         int block_size = header.audioInfo().block_align;
         p_decoder->setBlockSize(block_size);
+        p_decoder->setExtraData(header.extraData().data(),
+                                header.extraData().size());
         setupEncodedAudio();
       }
 
@@ -891,7 +959,12 @@ class WAVDecoder : public AudioDecoder {
       LOGE("WAV format not supported: 0x%04X", (unsigned)format);
       logSupportedFormats();
     }
-    return header.getDataPos();
+    // relative to this write (the 'data' tag is never in earlier writes,
+    // otherwise the header would have been complete already)
+    int result = data_start - buffered_before;
+    if (result < 0) result = 0;
+    if (result > (int)in_size) result = (int)in_size;
+    return result;
   }
 
   /// Logs (at error level) the WAV format tags this instance can currently
@@ -928,7 +1001,7 @@ class WAVDecoder : public AudioDecoder {
       assert(p_print != nullptr);
       dec_out.setOutput(p_print);
       dec_out.setDecoder(p_decoder);
-      dec_out.begin(info);
+      dec_out.begin(audioInfo());
     }
   }
 

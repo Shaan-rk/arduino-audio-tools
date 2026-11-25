@@ -1625,16 +1625,20 @@ class FilteredStream : public ModifyingStream {
     if (p_out != nullptr) p_out->flush();
   }
 
-  /// defines the filter for an individual channel - the first channel is 0. The
-  /// number of channels must have been defined before we can call this
-  /// function.
+  /// defines the filter for an individual channel - the first channel is 0. If
+  /// the number of channels has not been defined yet, it is extended
+  /// automatically.
   void setFilter(int channel, Filter<TF> *filter) {
+    if (channel >= converter.getChannels()) {
+      converter.setChannels(channel + 1);
+      if (channels < channel + 1) channels = channel + 1;
+    }
     converter.setFilter(channel, filter);
   }
 
-  /// defines the filter for an individual channel - the first channel is 0. The
-  /// number of channels must have been defined before we can call this
-  /// function.
+  /// defines the filter for an individual channel - the first channel is 0. If
+  /// the number of channels has not been defined yet, it is extended
+  /// automatically.
   void setFilter(int channel, Filter<TF> &filter) {
     setFilter(channel, &filter);
   }
@@ -1756,15 +1760,17 @@ class VolumeMeter : public ModifyingStream {
   float volumeAvg() {
     float total = 0;
     size_t count = 0;
-    for (int j = 0; j < info.channels; j++) {
+    for (int j = 0; j < info.channels && j < (int)sum.size(); j++) {
       total += sum[j];
       count += sample_count_per_channel;
     }
-    return total / count;
+    return count > 0 ? total / count : 0.0f;
   }
 
   /// Average volume of indicated channel
   float volumeAvg(int channel) {
+    if (channel < 0 || channel >= (int)sum.size() || sample_count_per_channel == 0)
+      return 0.0f;
     return sum[channel] / sample_count_per_channel;
   }
 
@@ -1871,8 +1877,9 @@ class VolumeMeter : public ModifyingStream {
       int ch = j % info.channels;
       if (tmp > volumes_tmp[ch]) {
         volumes_tmp[ch] = tmp;
-        sum_tmp[ch] = tmp;
       }
+      // sum of all samples for volumeAvg()
+      sum_tmp[ch] += tmp;
     }
   }
 

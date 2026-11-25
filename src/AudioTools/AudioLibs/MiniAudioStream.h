@@ -97,12 +97,7 @@ class MiniAudioStream : public AudioStream {
         in.channels != config.channels ||
         in.bits_per_sample != config.bits_per_sample) {
       config.copyFrom(in);
-      if (is_active.load()) {
-        is_active.store(false);
-        is_playing.store(false);
-        // This will stop the device so no need to do that manually.
-        ma_device_uninit(&device_ma);
-
+      if (stopDevice()) {
         begin();
       }
     }
@@ -116,6 +111,8 @@ class MiniAudioStream : public AudioStream {
 
   bool begin() override {
     TRACEI();
+    // release an already started device
+    stopDevice();
     setupBuffers(config.buffer_size);
     if (config.is_output && !config.is_input)
       config_ma = ma_device_config_init(ma_device_type_playback);
@@ -127,26 +124,33 @@ class MiniAudioStream : public AudioStream {
       config_ma = ma_device_config_init(ma_device_type_loopback);
 
     config_ma.pUserData = this;
-    config_ma.playback.channels = config.channels;
     config_ma.sampleRate = config.sample_rate;
     config_ma.dataCallback = data_callback;
+    ma_format format;
     switch (config.bits_per_sample) {
       case 8:
-        config_ma.playback.format = ma_format_u8;
+        format = ma_format_u8;
         break;
       case 16:
-        config_ma.playback.format = ma_format_s16;
+        format = ma_format_s16;
         break;
       case 24:
-        config_ma.playback.format = ma_format_s24;
+        format = ma_format_s24;
         break;
       case 32:
-        config_ma.playback.format = ma_format_s32;
+        format = ma_format_s32;
         break;
       default:
         LOGE("Invalid format");
         return false;
     }
+    // set both sides: otherwise a capture (or duplex/loopback) device uses
+    // the native format of the device, while data_callback() interprets the
+    // data in the requested format
+    config_ma.playback.format = format;
+    config_ma.playback.channels = config.channels;
+    config_ma.capture.format = format;
+    config_ma.capture.channels = config.channels;
 
     if (ma_device_init(NULL, &config_ma, &device_ma) != MA_SUCCESS) {
       // Failed to initialize the device.
@@ -165,14 +169,22 @@ class MiniAudioStream : public AudioStream {
   }
 
   void end() override {
-    is_active.store(false);
-    is_playing.store(false);
-    // This will stop the device so no need to do that manually.
-    ma_device_uninit(&device_ma);
+    stopDevice();
     // release buffer memory
     buffer_in.resize(0);
     buffer_out.resize(0);
     is_buffers_setup.store(false);
+  }
+
+  /// Stops and releases the device if it was started: returns true if it was
+  /// active. Not done for a device that was never started: e.g. the destructor
+  /// calls end() also if begin() was never called
+  bool stopDevice() {
+    if (!is_active.exchange(false)) return false;
+    is_playing.store(false);
+    // This will stop the device so no need to do that manually.
+    ma_device_uninit(&device_ma);
+    return true;
   }
 
   int availableForWrite() override {

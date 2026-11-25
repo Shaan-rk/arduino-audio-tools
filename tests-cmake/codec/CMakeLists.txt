@@ -15,11 +15,14 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 endif()
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/aac-faad ${CMAKE_CURRENT_BINARY_DIR}/aac-faad)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/aac-faad2 ${CMAKE_CURRENT_BINARY_DIR}/aac-faad2)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/aac-faac-encode ${CMAKE_CURRENT_BINARY_DIR}/aac-faac-encode)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/aac-fdk ${CMAKE_CURRENT_BINARY_DIR}/aac-fdk)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/aac-fdk-encode ${CMAKE_CURRENT_BINARY_DIR}/aac-fdk-encode)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/aac-helix ${CMAKE_CURRENT_BINARY_DIR}/aac-helix)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/adpcm ${CMAKE_CURRENT_BINARY_DIR}/adpcm)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/alac ${CMAKE_CURRENT_BINARY_DIR}/alac)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/atrac ${CMAKE_CURRENT_BINARY_DIR}/atrac)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/container-avi ${CMAKE_CURRENT_BINARY_DIR}/container-avi)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/container-binary ${CMAKE_CURRENT_BINARY_DIR}/container-binary)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/container-m4a ${CMAKE_CURRENT_BINARY_DIR}/container-m4a)
@@ -40,3 +43,4 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/wav ${CMAKE_CURRENT_BINARY_DIR}/wav
 
 #add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/container-avi-movie ${CMAKE_CURRENT_BINARY_DIR}/container-avi-movie)
 
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/wav-decoder-chunks ${CMAKE_CURRENT_BINARY_DIR}/wav-decoder-chunks)

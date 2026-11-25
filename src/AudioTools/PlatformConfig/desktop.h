@@ -39,6 +39,7 @@
 #  define USE_TIMER
 #  define USE_CPP_TASK
 #  define USE_STD_CONCURRENCY
+#  define USE_CONCURRENCY
 #  define USE_OPENCV
 //#  define USE_3BYTE_INT24
 // Skip this alias if the build already has a real, TLS-capable
@@ -55,7 +56,9 @@ typedef WiFiClient WiFiClientSecure;
 #    define ESP32
 #  endif
 #  include "esp_idf_version.h"
-#  include "AudioTools/AudioLibs/Emulation/Arduino.h"
+#  ifndef ARDUINO
+#    include "AudioTools/AudioLibs/Emulation/Arduino.h"
+#  endif
 #else 
 //#  include "AudioTools/AudioLibs/Emulation/Arduino.h"
 //#  define USE_CPP_TASK
